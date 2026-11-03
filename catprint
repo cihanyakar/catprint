@@ -1,0 +1,377 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["bleak", "pillow", "fonttools", "prompt_toolkit"]
+# ///
+"""Print text or images on a GB0x BLE thermal printer ("cat printer").
+
+Usage:
+  catprint "Hello world"            print text
+  catprint photo.png                print an image (scaled to 384 px)
+  echo "list" | catprint            print text from stdin
+  catprint -s 40 "Big text"         font size
+  catprint --preview "test"         save a preview PNG instead of printing
+  catprint                          open the editor (in a terminal)
+"""
+import argparse, asyncio, os, sys, unicodedata
+
+_FRIBIDI_DIR = next((d for d in ("/opt/homebrew/lib", "/usr/local/lib") if os.path.exists(d + "/libfribidi.dylib")), None)
+if _FRIBIDI_DIR and "CATPRINT_REEXEC" not in os.environ:
+    # Pillow's raqm layout (needed for emoji sequences) loads fribidi at runtime. SIP strips DYLD
+    # variables when the shebang runs /usr/bin/env, so set the path here and re-exec the interpreter.
+    os.environ["CATPRINT_REEXEC"] = "1"
+    os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = _FRIBIDI_DIR + ":" + os.environ.get("DYLD_FALLBACK_LIBRARY_PATH", "/usr/local/lib:/usr/lib")
+    os.execv(sys.executable, [sys.executable, *sys.argv])
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+
+W = 384
+NAME = os.environ.get("CATPRINT_NAME", "GB03")
+TX = "0000ae01-0000-1000-8000-00805f9b34fb"
+RX = "0000ae02-0000-1000-8000-00805f9b34fb"
+FONT = "/System/Library/Fonts/Supplemental/Arial.ttf"
+FONT_BOLD = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"
+IMG_EXT = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".heic", ".tif", ".tiff"}
+
+
+def crc8(data):
+    c = 0
+    for b in data:
+        c ^= b
+        for _ in range(8):
+            c = ((c << 1) ^ 0x07) & 0xFF if c & 0x80 else (c << 1) & 0xFF
+    return c
+
+
+def pkt(cmd, data):
+    return bytes([0x51, 0x78, cmd, 0, len(data), 0]) + bytes(data) + bytes([crc8(data), 0xFF])
+
+
+FALLBACK_FONTS = ["/System/Library/Fonts/Supplemental/Arial Unicode.ttf", "/System/Library/Fonts/Apple Symbols.ttf"]
+EMOJI_FONT = "/System/Library/Fonts/Apple Color Emoji.ttc"
+EMOJI_PX = 160  # Apple Color Emoji only loads at fixed bitmap sizes
+EMOJI_PRESENTATION_BMP = {
+    0x231A, 0x231B, 0x23E9, 0x23EA, 0x23EB, 0x23EC, 0x23F0, 0x23F3, 0x25FD, 0x25FE, 0x2614, 0x2615,
+    *range(0x2648, 0x2654), 0x267F, 0x2693, 0x26A1, 0x26AA, 0x26AB, 0x26BD, 0x26BE, 0x26C4, 0x26C5, 0x26CE,
+    0x26D4, 0x26EA, 0x26F2, 0x26F3, 0x26F5, 0x26FA, 0x26FD, 0x2705, 0x270A, 0x270B, 0x2728, 0x274C, 0x274E,
+    0x2753, 0x2754, 0x2755, 0x2757, 0x2795, 0x2796, 0x2797, 0x27B0, 0x27BF, 0x2B1B, 0x2B1C, 0x2B50, 0x2B55,
+}
+JOINERS = {0xFE0E, 0xFE0F, 0x200D, *range(0x1F3FB, 0x1F400), *range(0xE0020, 0xE0080)}
+
+
+def cmap(path):
+    from fontTools.ttLib import TTFont
+    return set(TTFont(path, fontNumber=0, lazy=True).getBestCmap())
+
+
+class TextRenderer:
+    """Picks a font per character. Arial first, then Unicode and symbol fallbacks, then color emoji."""
+
+    def __init__(self, size, bold):
+        self.size = size
+        paths = [FONT_BOLD if bold else FONT] + FALLBACK_FONTS
+        self.fonts = [(ImageFont.truetype(p, size), cmap(p)) for p in paths]
+        self.emoji = ImageFont.truetype(EMOJI_FONT, EMOJI_PX)
+        self.emoji_cmap = cmap(EMOJI_FONT)
+        self.scale = size / EMOJI_PX * 1.05
+
+    def kind(self, cluster, nxt=""):
+        """Picks a font for a cluster (base character plus combining marks)."""
+        cps = [ord(c) for c in cluster]
+        cp, ch = cps[0], cluster[0]
+        if ch.isspace() and len(cps) == 1:
+            return 0
+        if cp in self.emoji_cmap and nxt != "\ufe0e":
+            # explicit emoji selector, default-emoji BMP characters and code points from 0x1F000 render as emoji
+            if nxt == "\ufe0f" or cp in EMOJI_PRESENTATION_BMP or cp >= 0x1F000:
+                return "emoji"
+        for i, (_, cm) in enumerate(self.fonts):  # prefer a font that covers the whole cluster
+            if all(c in cm for c in cps):
+                return i
+        for i, (_, cm) in enumerate(self.fonts):
+            if cp in cm:
+                return i
+        return "emoji" if cp in self.emoji_cmap else 0
+
+    def runs(self, s):
+        # split into clusters first so combining marks stay with their base
+        clusters = []
+        for ch in s:
+            if clusters and (unicodedata.category(ch) in ("Mn", "Me") or ord(ch) in JOINERS):
+                clusters[-1] += ch
+            else:
+                clusters.append(ch)
+        out = []
+        for j, cl in enumerate(clusters):
+            nxt = cl[1] if len(cl) > 1 else ""
+            k = self.kind("".join(c for c in cl if ord(c) not in JOINERS) or cl, nxt)
+            if k != "emoji":
+                cl = "".join(c for c in cl if ord(c) not in (0xFE0E, 0xFE0F))  # drop variation selectors outside emoji
+            if out and out[-1][0] == k:
+                out[-1][1] += cl  # consecutive emoji form one run so raqm can shape sequences
+            else:
+                out.append([k, cl])
+        return out
+
+    def run_width(self, k, t):
+        if k == "emoji":
+            return self.emoji.getlength(t) * self.scale
+        return self.fonts[k][0].getlength(t)
+
+    def width(self, s):
+        return sum(self.run_width(k, t) for k, t in self.runs(s))
+
+
+def wrap(text, r, width):
+    lines = []
+    for para in text.splitlines() or [""]:
+        cur = ""
+        for w in para.split(" "):
+            cand = (cur + " " + w) if cur else w
+            if r.width(cand) <= width:
+                cur = cand
+                continue
+            if cur:
+                lines.append(cur)
+            # break a word that is wider than the line character by character
+            while r.width(w) > width:
+                i = len(w)
+                while i > 1 and r.width(w[:i]) > width:
+                    i -= 1
+                lines.append(w[:i])
+                w = w[i:]
+            cur = w
+        lines.append(cur)
+    return lines
+
+
+def render_text(text, size, bold, center):
+    r = TextRenderer(size, bold)
+    margin = 6
+    lines = wrap(text, r, W - 2 * margin)
+    asc, desc = r.fonts[0][0].getmetrics()
+    lh = asc + desc + max(2, size // 8)
+    canvas = Image.new("L", (W, lh * len(lines) + 8), 255)
+    d = ImageDraw.Draw(canvas)
+    emoji_boxes = []
+    for i, line in enumerate(lines):
+        x = (W - r.width(line)) / 2 if center else margin
+        base = 4 + i * lh + asc
+        for k, t in r.runs(line):
+            w = r.run_width(k, t)
+            if k == "emoji":
+                tile = Image.new("RGBA", (max(1, int(r.emoji.getlength(t))) + 4, EMOJI_PX + 40), (255, 255, 255, 255))
+                ImageDraw.Draw(tile).text((0, 0), t, font=r.emoji, embedded_color=True)
+                bb = tile.convert("L").point(lambda v: 255 if v > 250 else 0).getbbox() or (0, 0, 1, 1)
+                tile = tile.crop((0, 0, tile.width, bb[3])).convert("L")
+                tw, th = max(1, round(w)), max(1, round(tile.height * r.scale))
+                tile = ImageOps.autocontrast(tile.resize((tw, th), Image.LANCZOS), cutoff=1)
+                y = int(base + desc * 0.6 - th)
+                canvas.paste(tile, (int(x), y))
+                emoji_boxes.append((int(x), max(0, y), int(x) + tw, y + th))
+            else:
+                d.text((x, base), t, font=r.fonts[k][0], fill=0, anchor="ls")
+            x += w
+    img = canvas.point(lambda v: 0 if v < 140 else 255).convert("1", dither=Image.Dither.NONE)
+    for box in emoji_boxes:  # emoji are grayscale, so dither them
+        img.paste(canvas.crop(box).convert("1", dither=Image.Dither.FLOYDSTEINBERG), box[:2])
+    return img
+
+
+BRAILLE_BITS = [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (0, 3), (1, 3)]  # bit -> (x, y) dot position
+
+
+def is_braille_art(text):
+    chars = [c for c in text if not c.isspace()]
+    return bool(chars) and all(0x2800 <= ord(c) <= 0x28FF for c in chars)
+
+
+def render_braille(text, cell=None):
+    """Draws Braille art dot by dot as pixel blocks instead of using a font."""
+    lines = text.splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    cols = max(len(l) for l in lines) * 2
+    cell = cell or max(1, min(10, W // cols))
+    w, h = cols * cell, len(lines) * 4 * cell
+    img = Image.new("1", (W, h + 8), 1)
+    d = ImageDraw.Draw(img)
+    ox = (W - w) // 2
+    for row, line in enumerate(lines):
+        for col, ch in enumerate(line):
+            v = ord(ch) - 0x2800
+            if not 0 < v <= 0xFF:
+                continue
+            for bit, (dx, dy) in enumerate(BRAILLE_BITS):
+                if v >> bit & 1:
+                    x, y = ox + (col * 2 + dx) * cell, 4 + (row * 4 + dy) * cell
+                    d.rectangle([x, y, x + cell - 1, y + cell - 1], fill=0)
+    return img
+
+
+def render_image(path, rotate, no_dither):
+    img = Image.open(path)
+    img = ImageOps.exif_transpose(img)
+    if img.mode in ("RGBA", "LA", "P"):
+        img = img.convert("RGBA")
+        bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+        img = Image.alpha_composite(bg, img)
+    if rotate or (rotate is None and img.width > img.height * 1.3):
+        img = img.rotate(90, expand=True)
+    img = img.convert("L")
+    img = img.resize((W, max(1, round(img.height * W / img.width))), Image.LANCZOS)
+    img = ImageOps.autocontrast(img)
+    return img.convert("1", dither=Image.Dither.NONE if no_dither else Image.Dither.FLOYDSTEINBERG)
+
+
+def build(img, energy, feed):
+    px = img.load()
+    out = pkt(0xA3, [0]) + pkt(0xA4, [0x33])
+    out += pkt(0xA6, [0xAA, 0x55, 0x17, 0x38, 0x44, 0x5F, 0x5F, 0x5F, 0x44, 0x38, 0x2C])
+    out += pkt(0xAF, [energy & 0xFF, (energy >> 8) & 0xFF]) + pkt(0xBE, [0x01]) + pkt(0xA9, [0x00])
+    for y in range(img.height):
+        row = bytearray(W // 8)
+        for x in range(W):
+            if px[x, y] == 0:
+                row[x // 8] |= 1 << (x % 8)
+        out += pkt(0xA2, row)
+    out += pkt(0xA1, [feed & 0xFF, (feed >> 8) & 0xFF])
+    out += pkt(0xA6, [0xAA, 0x55, 0x17, 0, 0, 0, 0, 0, 0, 0, 0x17]) + pkt(0xA3, [0])
+    return out
+
+
+CTRL_ENTER_SEQS = (
+    "\x1b[27;5;13~", "\x1b[27;6;13~", "\x1b[27;9;13~",  # xterm modifyOtherKeys (Ctrl, Ctrl+Shift, Cmd)
+    "\x1b[13;5u", "\x1b[13;6u", "\x1b[13;9u",           # CSI u / kitty reporting
+)
+
+
+def editor():
+    """Editor shown when called without input. Ctrl+Enter prints, Esc clears, Esc on empty quits."""
+    from prompt_toolkit import Application
+    from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.keys import Keys
+    from prompt_toolkit.layout import HSplit, Layout, Window
+    from prompt_toolkit.layout.controls import FormattedTextControl
+    from prompt_toolkit.widgets import Frame, TextArea
+
+    for seq in CTRL_ENTER_SEQS:
+        ANSI_SEQUENCES[seq] = Keys.F24
+    ANSI_SEQUENCES["\x1b[27u"] = Keys.Escape  # Esc in terminals with CSI u enabled
+
+    area = TextArea(multiline=True, scrollbar=True, wrap_lines=False, focus_on_click=True)
+    kb = KeyBindings()
+
+    @kb.add(Keys.F24)
+    @kb.add("c-s")
+    def _print(e):
+        if area.text.strip():
+            e.app.exit(result=area.text)
+
+    @kb.add("escape", eager=True)
+    def _esc(e):
+        if area.text:
+            area.text = ""
+        else:
+            e.app.exit(result=None)
+
+    @kb.add("c-c")
+    @kb.add("c-q")
+    def _quit(e):
+        e.app.exit(result=None)
+
+    def status():
+        t = area.text
+        if not t.strip():
+            info = "empty, paste or type"
+        elif is_braille_art(t):
+            info = f"{len(t.splitlines())} lines, Braille art (dot mode)"
+        else:
+            info = f"{len(t.splitlines())} lines of text"
+        return [("reverse", " Ctrl+Enter "), ("", " print  "), ("reverse", " Esc "), ("", " clear / quit when empty  "),
+                ("reverse", " Ctrl+S "), ("", " print (fallback)   "), ("italic", info)]
+
+    root = HSplit([Frame(area, title=f"catprint → {NAME}"), Window(FormattedTextControl(status), height=1)])
+    app = Application(layout=Layout(root, focused_element=area), key_bindings=kb, full_screen=True,
+                      mouse_support=False, erase_when_done=True)
+    app.ttimeoutlen = 0.05
+    app.timeoutlen = 0.05
+    sys.stdout.write("\x1b[>4;1m")  # modifyOtherKeys, so Ctrl+Enter is reported separately
+    sys.stdout.flush()
+    try:
+        return app.run()
+    finally:
+        # reset modifyOtherKeys, leave the alternate screen, clear screen and scrollback
+        sys.stdout.write("\x1b[>4;0m\x1b[?1049l\x1b[0m\x1b[2J\x1b[3J\x1b[H")
+        sys.stdout.flush()
+
+
+async def send(data):
+    from bleak import BleakClient, BleakScanner
+    dev = await BleakScanner.find_device_by_name(NAME, timeout=12)
+    if dev is None:  # the first scan can miss it right after a previous connection closed
+        dev = await BleakScanner.find_device_by_name(NAME, timeout=12)
+    if dev is None:
+        sys.exit(f"catprint: '{NAME}' not found. Is the printer on and nearby?")
+    resume = asyncio.Event()
+    resume.set()
+
+    def on_notify(_, b):
+        if len(b) >= 7 and b[2] == 0xAE:
+            resume.clear() if b[6] == 0x10 else resume.set()
+
+    async with BleakClient(dev) as c:
+        await c.start_notify(RX, on_notify)
+        for i in range(0, len(data), 180):
+            await asyncio.wait_for(resume.wait(), 30)
+            await c.write_gatt_char(TX, data[i:i + 180], response=False)
+            await asyncio.sleep(0.02)
+        await asyncio.sleep(2 + len(data) / 20000)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="catprint", description="Print text or images on a GB0x BLE thermal printer.")
+    ap.add_argument("input", nargs="*", help="text or image path (stdin or editor when empty)")
+    ap.add_argument("-s", "--size", type=int, default=26, help="font size (default 26)")
+    ap.add_argument("-b", "--bold", action="store_true", help="bold text")
+    ap.add_argument("-c", "--center", action="store_true", help="center text")
+    ap.add_argument("-e", "--energy", type=int, default=12000, help="print darkness (default 12000, 0x2EE0)")
+    ap.add_argument("-f", "--feed", type=int, default=112, help="paper feed lines at the end (default 112)")
+    ap.add_argument("-r", "--rotate", action="store_true", default=None, help="rotate the image 90°")
+    ap.add_argument("--no-rotate", dest="rotate", action="store_false", help="do not auto-rotate wide images")
+    ap.add_argument("--no-dither", action="store_true", help="threshold images instead of dithering")
+    ap.add_argument("--no-braille", action="store_true", help="render Braille art with a font instead of dots")
+    ap.add_argument("-p", "--preview", metavar="PNG", nargs="?", const="catprint_preview.png",
+                    help="save a preview instead of printing")
+    a = ap.parse_args()
+
+    if len(a.input) == 1 and os.path.isfile(a.input[0]) and os.path.splitext(a.input[0])[1].lower() in IMG_EXT:
+        img = render_image(a.input[0], a.rotate, a.no_dither)
+    else:
+        if a.input:
+            text = " ".join(a.input)
+        elif sys.stdin.isatty():
+            text = editor()
+            if text is None:
+                return
+            text = text.rstrip("\n")
+            print("printing...")
+        else:
+            text = sys.stdin.read().rstrip("\n")
+        if not text:
+            ap.error("nothing to print")
+        if is_braille_art(text) and not a.no_braille:
+            img = render_braille(text)
+        else:
+            img = render_text(text, a.size, a.bold, a.center)
+
+    if a.preview:
+        img.save(a.preview)
+        print(f"preview: {os.path.abspath(a.preview)} ({img.width}x{img.height})")
+        return
+    asyncio.run(send(build(img, a.energy, a.feed)))
+    print(f"printed ({img.height} rows)")
+
+
+if __name__ == "__main__":
+    main()
