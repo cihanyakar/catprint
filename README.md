@@ -38,7 +38,7 @@ Running `catprint` in a terminal without any text opens a full-screen editor. It
 | Key | Action |
 |---|---|
 | Ctrl+Enter | Print and exit |
-| Ctrl+S | Print and exit (for terminals that cannot report Ctrl+Enter) |
+| Ctrl+P or Ctrl+S | Print and exit (use these where Ctrl+Enter is taken, such as Terminal.app) |
 | Esc | Clear the buffer |
 | Esc (when empty) | Exit |
 | Ctrl+C | Exit without printing |

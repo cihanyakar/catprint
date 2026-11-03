@@ -246,7 +246,7 @@ CTRL_ENTER_SEQS = (
 
 
 def editor():
-    """Editor shown when called without input. Ctrl+Enter prints, Esc clears, Esc on empty quits."""
+    """Editor shown when called without input. Ctrl+Enter, Ctrl+P or Ctrl+S prints, Esc clears, Esc on empty quits."""
     from prompt_toolkit import Application
     from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
     from prompt_toolkit.key_binding import KeyBindings
@@ -264,6 +264,7 @@ def editor():
 
     @kb.add(Keys.F24)
     @kb.add("c-s")
+    @kb.add("c-p")
     def _print(e):
         if area.text.strip():
             e.app.exit(result=area.text)
@@ -289,7 +290,7 @@ def editor():
         else:
             info = f"{len(t.splitlines())} lines of text"
         return [("reverse", " Ctrl+Enter "), ("", " print  "), ("reverse", " Esc "), ("", " clear / quit when empty  "),
-                ("reverse", " Ctrl+S "), ("", " print (fallback)   "), ("italic", info)]
+                ("reverse", " Ctrl+P/S "), ("", " print   "), ("italic", info)]
 
     root = HSplit([Frame(area, title=f"catprint → {NAME}"), Window(FormattedTextControl(status), height=1)])
     app = Application(layout=Layout(root, focused_element=area), key_bindings=kb, full_screen=True,
